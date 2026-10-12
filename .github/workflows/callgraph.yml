@@ -1,0 +1,106 @@
+name: Call Graph
+
+# Static AST call graph of the urwid package -> graph.json + embeddings (uploaded as an artifact).
+
+on:
+  push:
+    paths:
+      - "urwid/**"
+      - ".github/callgraph/**"
+      - ".github/workflows/callgraph.yml"
+  pull_request:
+    paths:
+      - "urwid/**"
+      - ".github/callgraph/**"
+      - ".github/workflows/callgraph.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: "Self-test (Python ${{ matrix.python-version }})"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "${{ matrix.python-version }}"
+      - name: Run call-graph self-test
+        run: python .github/callgraph/selftest.py
+
+  callgraph:
+    name: Build graph.json
+    needs: selftest
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Analyse the real head commit, not the PR's synthetic merge commit.
+      COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COMMIT }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Parse AST and extract call graph
+        run: |
+          python .github/callgraph/callgraph.py urwid \
+            --root . \
+            -o out/graph.json \
+            --summary out/summary.md
+
+      - name: Validate graph.json (incl. node text)
+        run: python .github/callgraph/check_outputs.py out/graph.json
+
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-snowflake-arctic-embed-m-v1.5
+
+      - name: Install embedding dependencies (CPU)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install sentence-transformers numpy networkx
+
+      - name: Load graph.json with networkx (node_link)
+        run: |
+          python - <<'EOF'
+          import json, networkx as nx
+          d = json.load(open("out/graph.json"))
+          G = nx.node_link_graph(d, edges="edges")
+          assert G.is_directed() and G.is_multigraph()
+          assert G.number_of_nodes() == len(d["nodes"]) and G.number_of_edges() == len(d["edges"])
+          print(f"networkx {nx.__version__}: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+          EOF
+
+      - name: Embed node text (256-d)
+        env:
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: |
+          python .github/callgraph/embed.py out/graph.json \
+            --out-dir out/embeddings \
+            --repo "${GITHUB_REPOSITORY#*/}" \
+            --dim 256
+
+      - name: Validate embeddings
+        run: python .github/callgraph/check_outputs.py out/graph.json --embeddings out/embeddings
+
+      - name: Job summary
+        run: cat out/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload graph.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: callgraph-${{ env.COMMIT }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
